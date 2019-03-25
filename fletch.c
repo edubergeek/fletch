@@ -64,7 +64,7 @@
 #include <stdlib.h>
 #include <memory.h>
 
-#define _DEBUG
+#undef _DEBUG
 
 #define DISK_BLKSZ 4096
 #define STRIPES 1
@@ -316,6 +316,8 @@ main(int argc, char *argv[])
 		close(fd);
 
 	}
+	free(disk_block);
+	free(f128);
 
 	exit(0);
 }
