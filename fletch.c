@@ -32,6 +32,22 @@
 
 /*
  * fletch.c -- Compute Fletcher-64 and Fletcher-128 checksums on each file specified on the command line
+ * GPU accelerated version
+ * 
+ * pattern:
+ * Get # of SMs in GPU
+ * malloc and device alloc
+ * allocate 128 32 bit integers in host memory
+ * alloc and intialize to zero 128 32 bit integers in device memory
+ * do until EOF
+ *   read 64 4k contiguous blocks from file (how to handle the last chunk)
+ *   sync threads
+ *   copy host to device 
+ *   launch 64 threads that each compute Fletcher-64 on 64x 64 bit (8 byte) 4K blocks
+ *     512 steps updating each thread's hi and lo register
+ * copy 128 32 bit integers from device to host memory
+ * pad the last 64 64 bit blocks with zeros in CPU memory
+ * output 64x 16 byte checksums
  *
  * usage: fletch files...
  */
@@ -40,50 +56,134 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <inttypes.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <memory.h>
 
-struct _f128 {
-	uint64_t hi64;
+#define _DEBUG
+
+#define DISK_BLKSZ 4096
+#define STRIPES 1
+
+struct _f128 { uint64_t hi64;
 	uint64_t lo64;
 };
 
+static struct _f128 *f128;
+static char *disk_block;
+static size_t block_size = DISK_BLKSZ;
+static int stripes = STRIPES;
+
 /*
- * fletcher64 -- compute a Fletcher64 checksum
+ * fletcher128 -- compute a Fletcher128 checksum
  *
- * Gold standard implementation used to compare to the
- * util_checksum() being unit tested.
  */
-static struct _f128
-*fletcher128(void *addr, size_t len)
+void fletcher128_striped(struct _f128 *f128, char *addr, size_t len)
 {
+	/* NOTE len is a byte count not a block or uint64_t count */
+	uint64_t zeropad = 0;
+	int b;
+	int full_stripes = stripes;
+	int zero_stripes = 0;
+	uint64_t zero_len = 0;
+
+	if(len < stripes*block_size) {
+		full_stripes = len / block_size;
+		if(len % block_size) {
+			zero_stripes = 1;
+			zero_len = (uint64_t)len % block_size;
+			/* handle lengths that don't fall on a 64 bit aligned address */
+			zeropad = zero_len % 8;
+			if(zeropad) {
+				/* invert from length of data in incomplete block to number of pad positions */
+ 				zeropad = 8 - zeropad;
+				/* now coerce the length so as to end on the next uint64_t aligned pointer */
+				zero_len += zeropad;
+				/* finally, pad with zeros to the next uint64_t aligned pointer */
+				memset(addr+(full_stripes*block_size)+zero_len-zeropad,0,zeropad);
+			}
+#ifdef _DEBUG
+			printf("full %d zero %d len %lu zero_len %lu zeropad %lu\n", full_stripes, zero_stripes, len, zero_len, zeropad);
+#endif
+		}
+	}
+	else
+		len /= stripes;
+	for(b=0;b<full_stripes+zero_stripes;b++) {
+		uint64_t *p64 = (uint64_t*)(addr + b*block_size);
+		uint64_t *p64end = (uint64_t *)(addr + ((b+1)*block_size) );
+		struct _f128 *pf128 = &f128[b];
+
+		/* check for the final stripe which is probably truncated */
+		if(b == full_stripes) {
+			p64end = (uint64_t *)((addr + (b*block_size) + zero_len));
+		}
+		while (p64 < p64end) {
+			pf128->lo64 += le64toh(*p64);
+			p64++;
+			pf128->hi64 += pf128->lo64;
+		}
+#ifdef _DEBUG
+		printf("%d %016lx%016lx\n", b, pf128->hi64, pf128->lo64);
+#endif
+
+	}
+	return;
+}
+
+static struct _f128 *
+fletcher128(void *addr, size_t len)
+{
+	uint64_t zeropad = len % 8;
 	uint64_t *p64 = addr;
-	uint64_t *p64end = (uint64_t *)((char *)addr + len);
+	uint64_t *p64end = (uint64_t *)((char *)addr + len - zeropad);
 	static struct _f128 f128;
 	f128.lo64 = 0;
 	f128.hi64 = 0;
+	uint64_t bytes = 0;
 
 	while (p64 < p64end) {
 		f128.lo64 += le64toh(*p64);
 		p64++;
+		bytes -= sizeof(*p64);
+		f128.hi64 += f128.lo64;
+#ifdef _DEBUG
+		if(bytes % block_size == 0)
+			printf("%016lx%016lx\n", f128.hi64, f128.lo64);
+#endif
+
+	}
+	if(zeropad) {
+		/* printf("fletcher128: custom craft final block\n"); */
+		union { 
+			char pc[8];
+			uint64_t pll;
+		} pad;
+		int p = 0;
+		while(zeropad > 0)
+			pad.pc[p++] = ((char*)addr)[len-(zeropad--)];
+		while(p < 8)
+			pad.pc[p++] = 0;
+		f128.lo64 += le64toh(pad.pll);
 		f128.hi64 += f128.lo64;
 	}
-	while(len-- % 4 != 0) {
-		uint64_t zero = 0;
-		f128.lo64 += le64toh(zero);
-		f128.hi64 += f128.lo64;
-	}
+#ifdef _DEBUG
+	printf("%016lx%016lx\n", f128.hi64, f128.lo64);
+#endif
+
 	return &f128;
 }
 
 static uint64_t
 fletcher64(void *addr, size_t len)
 {
+	uint64_t zeropad = len % 4;
 	uint32_t *p32 = addr;
-	uint32_t *p32end = (uint32_t *)((char *)addr + len);
+	uint32_t *p32end = (uint32_t *)((char *)addr + len - zeropad);
 	uint32_t lo32 = 0;
 	uint32_t hi32 = 0;
 
@@ -92,9 +192,18 @@ fletcher64(void *addr, size_t len)
 		p32++;
 		hi32 += lo32;
 	}
-	while(len-- % 4 != 0) {
-		uint32_t zero = 0;
-		lo32 += le32toh(zero);
+	if(zeropad) {
+		/* printf("fletcher64: custom craft final block\n"); */
+		union { 
+			char pc[4];
+			uint32_t pl;
+		} pad;
+		int p = 0;
+		while(zeropad--)
+			pad.pc[p++] = ((char*)addr)[len++];
+		while(p < 4)
+			pad.pc[p++] = 0;
+		lo32 += le32toh(pad.pl);
 		hi32 += lo32;
 	}
 
@@ -104,17 +213,56 @@ fletcher64(void *addr, size_t len)
 int
 main(int argc, char *argv[])
 {
+	char* progname;
+	(progname = strrchr(argv[0], '/')) ? ++progname : (progname = argv[0]);
 	if (argc < 2) {
-		fprintf(stderr, "usage: %s files...\n", argv[0]);
+		fprintf(stderr, "usage: %s files...\n", progname);
 		exit(-1);
 	}
-	printf("%-30s %-12s %-16s %-32s\n", "file", "bytes", "Fletcher-64", "Fletcher-128");
 
-	int arg = 0;
-	for (arg = 1; arg < argc; arg++) {
+	/*
+	 * TODO add command line options -s stripes and -h (help)
+	 */
+	int arg;
+	int c;
+
+	opterr = 0;
+
+	while ((c = getopt (argc, argv, "b:s:")) != -1) {
+		switch (c)
+		{
+		case 'b':
+			block_size = (size_t)strtol(optarg, NULL, 0);
+			block_size = (block_size / 8) * 8;
+			break;
+		case 's':
+			stripes = atoi(optarg);
+			break;
+		case '?':
+			if (optopt == 'b' || optopt == 's')
+				fprintf (stderr, "%s: option -%c requires an argument.\n", progname, optopt);
+			else if (isprint (optopt))
+				fprintf (stderr, "%s: unknown option `-%c'.\n", progname, optopt);
+			else
+				fprintf (stderr, "%s: unknown option character `\\x%x'.\n", progname, optopt);
+			return 1;
+		default:
+			abort ();
+		}
+
+	}
+
+	/* allocate disk buffer for stripes x blocks */
+	disk_block = calloc(block_size, stripes);
+	assert(disk_block != NULL);
+	/* allocate disk buffer for stripes x checksums */
+	f128 = calloc(sizeof(struct _f128), stripes);
+	assert(f128 != NULL);
+
+	for (arg = optind; arg < argc; arg++) {
 		int fd = open(argv[arg], O_RDONLY);
 		if(fd == -1) {
-			fprintf(stderr, "Cannot open file: %s\n", argv[arg]);
+			fprintf(stderr, "%s: cannot open file: %s\n", progname, argv[arg]);
 			exit(-1);
 		}
 
@@ -122,20 +270,54 @@ main(int argc, char *argv[])
 		fstat(fd, &stbuf);
 		size_t size = (size_t)stbuf.st_size;
 
-		/* pad to 32 bit blocks */
-		void *addr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
-		assert(addr != NULL);
+		if(!strcmp(progname,"fletcher64")) {
+			/* pad to 32 bit blocks */
+			void *addr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+			assert(addr != NULL);
 
-		/* calculate checksum */
-		uint64_t csum = fletcher64(addr, size);
+			/* calculate fletch-64 checksum */
+			uint64_t csum = fletcher64(addr, size);
+			printf("%-30s %016lx%016lx\n", argv[arg], size, csum );
+			munmap(addr, size);
+		}
 
-		struct _f128 *f128 = fletcher128(addr, size);
-		printf("%-30s %-12lu %016lx %016lx%016lx\n", argv[arg], size, csum, f128->hi64, f128->lo64);
+		else if(!strcmp(progname,"fletcher128")) {
+			/* pad to 64 bit blocks */
+			void *addr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+			assert(addr != NULL);
+
+			/* calculate fletcher-128 */
+			struct _f128*  f128sum = fletcher128(addr, size);
+			printf("%-30s %016lx%016lx%016lx\n", argv[arg], size, f128sum->hi64, f128sum->lo64);
+			munmap(addr, size);
+		}
+		else {
+			memset(f128,0, stripes * sizeof(*f128));
+			/* calculate strided Fletch-128 checksum */
+			size_t remain = size;
+			while(remain > 0) {
+				/* read the file stripes blocks of size block_size per iteration */
+				size_t len;
+				len  = read(fd, disk_block, stripes*block_size);
+				if(len) {
+					fletcher128_striped(f128, disk_block, len);
+				}
+				remain -= len;
+			}
+			printf("%-30s %016lx", argv[arg], size);
+			int s = 0;
+			while(s < stripes) {
+ 				printf("%016lx%016lx", f128[s].hi64, f128[s].lo64);
+				s++;
+			}
+ 			printf("\n");
+		}
 
 		close(fd);
-		munmap(addr, size);
 
 	}
 
 	exit(0);
 }
+
+
