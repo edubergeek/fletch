@@ -113,22 +113,32 @@ void fletcher128_striped(struct _f128 *f128, char *addr, size_t len)
 	}
 	else
 		len /= stripes;
-	for(b=0;b<full_stripes+zero_stripes;b++) {
-		uint64_t *p64 = (uint64_t*)(addr + b*block_size);
-		uint64_t *p64end = (uint64_t *)(addr + ((b+1)*block_size) );
-		struct _f128 *pf128 = &f128[b];
-
-		/* check for the final stripe which is probably truncated */
-		if(b == full_stripes) {
-			p64end = (uint64_t *)((addr + (b*block_size) + zero_len));
-		}
-		while (p64 < p64end) {
-			pf128->lo64 += le64toh(*p64);
-			p64++;
-			pf128->hi64 += pf128->lo64;
+	/* each stripe is accumulated into pf128[stripe] */
+	/* set up an array of block pointers one for each stripe */
+	uint64_t *p64 = (uint64_t*)(addr);
+	uint64_t *p64end = (uint64_t *)(addr + full_stripes*block_size);
+	size_t bytes = 0;
+	if(zero_stripes)
+		p64end = (uint64_t *)(addr + (full_stripes*block_size) + zero_len);
+	while (p64 < p64end) {
+		for(b=0;b<stripes;b++) {
+			if (p64 < p64end) {
+				f128[b].lo64 += le64toh(*p64);
+				p64++;
+				f128[b].hi64 += f128[b].lo64;
+				bytes += sizeof(*p64);
+			}
 		}
 #ifdef _DEBUG
-		printf("%d %016lx%016lx\n", b, pf128->hi64, pf128->lo64);
+		if(bytes % 4096 == 0) {
+			int s = 0;
+ 			printf("%016lx ", bytes);
+			while(s < stripes) {
+ 				printf("%016lx%016lx", f128[s].hi64, f128[s].lo64);
+				s++;
+			}
+ 			printf("\n");
+		}
 #endif
 
 	}
@@ -277,7 +287,7 @@ main(int argc, char *argv[])
 
 			/* calculate fletch-64 checksum */
 			uint64_t csum = fletcher64(addr, size);
-			printf("%-30s %016lx%016lx\n", argv[arg], size, csum );
+			printf("%016lx%016lx %s\n", csum, size, argv[arg]);
 			munmap(addr, size);
 		}
 
@@ -288,7 +298,7 @@ main(int argc, char *argv[])
 
 			/* calculate fletcher-128 */
 			struct _f128*  f128sum = fletcher128(addr, size);
-			printf("%-30s %016lx%016lx%016lx\n", argv[arg], size, f128sum->hi64, f128sum->lo64);
+			printf("%016lx%016lx%016lx %s\n", f128sum->hi64, f128sum->lo64, size, argv[arg]);
 			munmap(addr, size);
 		}
 		else {
@@ -304,13 +314,12 @@ main(int argc, char *argv[])
 				}
 				remain -= len;
 			}
-			printf("%-30s %016lx", argv[arg], size);
 			int s = 0;
 			while(s < stripes) {
  				printf("%016lx%016lx", f128[s].hi64, f128[s].lo64);
 				s++;
 			}
- 			printf("\n");
+			printf("%016lx %s\n", size, argv[arg]);
 		}
 
 		close(fd);
